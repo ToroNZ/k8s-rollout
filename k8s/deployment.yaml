@@ -1,0 +1,83 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k8s-rollout-controller
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-rollout-controller
+  namespace: k8s-rollout-controller
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-rollout-controller
+rules:
+  # Need to watch and list deployments
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch"]
+  # Need to read deployment status
+  - apiGroups: ["apps"]
+    resources: ["deployments/status"]
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-rollout-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8s-rollout-controller
+subjects:
+  - kind: ServiceAccount
+    name: k8s-rollout-controller
+    namespace: k8s-rollout-controller
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-rollout-controller
+  namespace: k8s-rollout-controller
+  labels:
+    app: k8s-rollout-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8s-rollout-controller
+  template:
+    metadata:
+      labels:
+        app: k8s-rollout-controller
+    spec:
+      serviceAccountName: k8s-rollout-controller
+      containers:
+        - name: controller
+          image: k8s-rollout-controller:latest  # Replace with your image
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RUST_LOG
+              value: "info"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true

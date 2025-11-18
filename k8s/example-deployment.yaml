@@ -1,0 +1,69 @@
+---
+# Example deployment that will be monitored by the k8s-rollout-controller
+# The controller will automatically trigger a rollout when the image digest changes
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: example-app
+  namespace: default
+  labels:
+    app: example-app
+    # This label tells the controller to monitor this deployment
+    io.v0l.rollout: "true"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: example-app
+  template:
+    metadata:
+      labels:
+        app: example-app
+    spec:
+      containers:
+        - name: nginx
+          # Using a tag like 'latest' or 'stable' - the controller will detect
+          # when the digest for this tag changes and trigger a rollout
+          image: nginx:latest
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+
+---
+# Another example with a specific image registry
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: example-app-gcr
+  namespace: default
+  labels:
+    app: example-app-gcr
+    io.v0l.rollout: "true"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: example-app-gcr
+  template:
+    metadata:
+      labels:
+        app: example-app-gcr
+    spec:
+      containers:
+        - name: app
+          # Example with Google Container Registry
+          image: gcr.io/google-containers/busybox:latest
+          command: ["sleep", "3600"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
