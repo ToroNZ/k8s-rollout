@@ -61,7 +61,7 @@ spec:
       serviceAccountName: k8s-rollout-controller
       containers:
         - name: controller
-          image: k8s-rollout-controller:latest  # Replace with your image
+          image: ghcr.io/toronz/k8s-rollout/k8s-rollout:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: RUST_LOG
