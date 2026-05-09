@@ -112,30 +112,55 @@ The controller requires the following permissions:
 
 - `deployments`: `get`, `list`, `watch`, `patch`
 - `deployments/status`: `get`
+- `secrets`: `get` (to read each monitored deployment's `imagePullSecrets`)
 
 These are configured in `k8s/deployment.yaml`.
 
 ## Registry Authentication
 
+The controller implements the standard OCI registry token-auth flow:
+
+1. Issue an anonymous manifest request.
+2. If the registry responds `401 Unauthorized`, parse the `WWW-Authenticate: Bearer realm=...,service=...,scope=...` challenge.
+3. Fetch a bearer token from the realm URL — anonymously, or with HTTP Basic auth using credentials resolved from the deployment's `imagePullSecrets`.
+4. Retry the manifest request with the token.
+
+The `Accept` header advertises Docker v2 manifests and OCI manifests/indexes, so multi-arch images work. If the registry returns a 200 manifest but no `Docker-Content-Digest` header, the controller falls back to hashing the manifest body — by the OCI spec the manifest digest is the SHA-256 of the response bytes, so this produces a stable, change-detection-safe identifier.
+
 ### Docker Hub
 
-The controller automatically handles Docker Hub authentication using anonymous tokens. This works for all public images without requiring credentials.
+Public images work with no configuration. For private repositories, attach an `imagePullSecret` of type `kubernetes.io/dockerconfigjson` to the monitored deployment (the same one Kubernetes already uses to pull the image).
 
-### Other Public Registries
+### Other Registries
 
-The controller supports:
-- Google Container Registry (gcr.io)
-- GitHub Container Registry (ghcr.io)
-- Quay.io
-- Any OCI-compliant registry that allows anonymous access
+Tested against ghcr.io, gcr.io, and Quay; works with any OCI-compliant registry that follows the bearer-token challenge flow.
 
 ### Private Registries
 
-**Note**: Private registry authentication is not yet fully implemented. For private registries, you would need to:
+The controller authenticates to private registries by reading the same `imagePullSecrets` that Kubernetes uses to pull the image. No extra configuration is required — if your deployment can pull the image, the controller can read its digest.
 
-1. Mount registry credentials into the controller pod
-2. Modify the code to use those credentials when fetching manifests
-3. Ensure the controller has network access to private registries
+For each monitored deployment, the controller:
+
+1. Reads `spec.template.spec.imagePullSecrets`.
+2. Fetches each referenced `Secret` (must be type `kubernetes.io/dockerconfigjson`) from the deployment's namespace.
+3. Looks up the registry host in the secret's `auths` map. Both the base64-encoded `auth` field and explicit `username`/`password` fields are supported.
+4. Uses those credentials when requesting the bearer token from the registry's auth realm.
+
+Create such a secret with:
+
+```bash
+kubectl create secret docker-registry ghcr-creds \
+  --docker-server=ghcr.io \
+  --docker-username=YOUR_GITHUB_USERNAME \
+  --docker-password=YOUR_GITHUB_PAT \
+  --namespace=YOUR_NAMESPACE
+
+kubectl patch deployment YOUR_DEPLOYMENT \
+  --namespace=YOUR_NAMESPACE \
+  --patch '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"ghcr-creds"}]}}}}'
+```
+
+The PAT needs `read:packages` scope for ghcr.io.
 
 ## Monitoring
 

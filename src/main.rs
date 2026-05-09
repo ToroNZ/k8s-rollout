@@ -1,11 +1,14 @@
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::Secret;
 use kube::{
     api::{Api, Patch, PatchParams},
     runtime::{controller::Action, watcher, Controller},
     Client, Error, ResourceExt,
 };
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -20,6 +23,7 @@ enum ControllerError {
     HttpError(reqwest::Error),
     ToStrError(reqwest::header::ToStrError),
     MissingField(&'static str),
+    Other(String),
 }
 
 impl std::fmt::Display for ControllerError {
@@ -29,6 +33,7 @@ impl std::fmt::Display for ControllerError {
             ControllerError::HttpError(e) => write!(f, "HTTP error: {}", e),
             ControllerError::ToStrError(e) => write!(f, "Header conversion error: {}", e),
             ControllerError::MissingField(field) => write!(f, "Missing field: {}", field),
+            ControllerError::Other(msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -56,6 +61,12 @@ impl From<reqwest::header::ToStrError> for ControllerError {
 impl From<&'static str> for ControllerError {
     fn from(s: &'static str) -> Self {
         ControllerError::MissingField(s)
+    }
+}
+
+impl From<String> for ControllerError {
+    fn from(s: String) -> Self {
+        ControllerError::Other(s)
     }
 }
 
@@ -125,8 +136,22 @@ async fn reconcile(deployment: Arc<Deployment>, ctx: Arc<ControllerContext>) -> 
 
     info!("Checking image: {}", image);
 
+    let pull_secret_names: Vec<String> = pod_spec
+        .image_pull_secrets
+        .as_ref()
+        .map(|refs| refs.iter().map(|r| r.name.clone()).collect())
+        .unwrap_or_default();
+
     // Fetch current digest from registry
-    match fetch_image_digest(&ctx.http_client, image).await {
+    match fetch_image_digest(
+        &ctx.client,
+        &ctx.http_client,
+        image,
+        &namespace,
+        &pull_secret_names,
+    )
+    .await
+    {
         Ok(current_digest) => {
             info!("Current digest for {}: {}", image, current_digest);
 
@@ -166,17 +191,26 @@ fn error_policy(_deployment: Arc<Deployment>, error: &ControllerError, _ctx: Arc
     Action::requeue(Duration::from_secs(60))
 }
 
-async fn fetch_image_digest(client: &reqwest::Client, image: &str) -> Result<String> {
-    // Parse the image reference
+async fn fetch_image_digest(
+    kube_client: &Client,
+    http_client: &reqwest::Client,
+    image: &str,
+    namespace: &str,
+    pull_secret_names: &[String],
+) -> Result<String> {
     let (registry, repository, tag) = parse_image_reference(image)?;
 
-    // For Docker Hub
+    let creds = if pull_secret_names.is_empty() {
+        None
+    } else {
+        resolve_pull_secret_credentials(kube_client, namespace, pull_secret_names, &registry).await
+    };
+
     if registry == "docker.io" || registry.is_empty() {
-        return fetch_dockerhub_digest(client, &repository, &tag).await;
+        return fetch_dockerhub_digest(http_client, &repository, &tag, creds.as_ref()).await;
     }
 
-    // For other registries (gcr.io, ghcr.io, etc.)
-    fetch_generic_registry_digest(client, &registry, &repository, &tag).await
+    fetch_generic_registry_digest(http_client, &registry, &repository, &tag, creds.as_ref()).await
 }
 
 fn parse_image_reference(image: &str) -> Result<(String, String, String)> {
@@ -215,6 +249,7 @@ async fn fetch_dockerhub_digest(
     client: &reqwest::Client,
     repository: &str,
     tag: &str,
+    creds: Option<&RegistryCredentials>,
 ) -> Result<String> {
     // Step 1: Get authentication token from Docker Hub
     let auth_url = format!(
@@ -222,7 +257,11 @@ async fn fetch_dockerhub_digest(
         repository
     );
 
-    let auth_response = client.get(&auth_url).send().await?;
+    let mut auth_req = client.get(&auth_url);
+    if let Some(c) = creds {
+        auth_req = auth_req.basic_auth(&c.username, Some(&c.password));
+    }
+    let auth_response = auth_req.send().await?;
     let auth_json: serde_json::Value = auth_response.json().await?;
     let token = auth_json["token"]
         .as_str()
@@ -256,26 +295,277 @@ async fn fetch_dockerhub_digest(
     }
 }
 
+const MANIFEST_ACCEPT_HEADER: &str = "application/vnd.docker.distribution.manifest.v2+json,\
+application/vnd.docker.distribution.manifest.list.v2+json,\
+application/vnd.oci.image.manifest.v1+json,\
+application/vnd.oci.image.index.v1+json";
+
 async fn fetch_generic_registry_digest(
     client: &reqwest::Client,
     registry: &str,
     repository: &str,
     tag: &str,
+    creds: Option<&RegistryCredentials>,
 ) -> Result<String> {
-    // Generic OCI registry API v2
     let url = format!("https://{}/v2/{}/manifests/{}", registry, repository, tag);
 
     let response = client
         .get(&url)
-        .header("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+        .header("Accept", MANIFEST_ACCEPT_HEADER)
         .send()
         .await?;
 
-    if let Some(digest) = response.headers().get("Docker-Content-Digest") {
-        Ok(digest.to_str()?.to_string())
+    let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        let challenge = response
+            .headers()
+            .get("WWW-Authenticate")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_www_authenticate)
+            .ok_or_else(|| {
+                ControllerError::Other(format!(
+                    "{} returned 401 with no parseable WWW-Authenticate challenge",
+                    registry
+                ))
+            })?;
+
+        let token = fetch_bearer_token(client, &challenge, creds).await?;
+
+        client
+            .get(&url)
+            .header("Accept", MANIFEST_ACCEPT_HEADER)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await?
     } else {
-        Err("No digest header in response".into())
+        response
+    };
+
+    if !response.status().is_success() {
+        return Err(ControllerError::Other(format!(
+            "{} returned status {} for {}/{}:{}",
+            registry,
+            response.status(),
+            registry,
+            repository,
+            tag
+        )));
     }
+
+    if let Some(digest) = response.headers().get("Docker-Content-Digest") {
+        return Ok(digest.to_str()?.to_string());
+    }
+
+    // Fallback: hash the manifest body. Per the OCI distribution spec the
+    // manifest digest is sha256 over the bytes returned on the wire, so this
+    // is equivalent to the Docker-Content-Digest header for registries that
+    // omit it (some Red Hat / ghcr edge cases).
+    debug!(
+        "No Docker-Content-Digest from {} for {}:{}, hashing body",
+        registry, repository, tag
+    );
+    let body = response.bytes().await?;
+    let mut hasher = Sha256::new();
+    hasher.update(&body);
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+#[derive(Debug, Clone)]
+struct RegistryCredentials {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug)]
+struct AuthChallenge {
+    realm: String,
+    service: Option<String>,
+    scope: Option<String>,
+}
+
+fn parse_www_authenticate(header: &str) -> Option<AuthChallenge> {
+    let header = header.trim();
+    let rest = header
+        .strip_prefix("Bearer")
+        .or_else(|| header.strip_prefix("bearer"))?
+        .trim_start();
+
+    let mut realm = None;
+    let mut service = None;
+    let mut scope = None;
+
+    for part in rest.split(',') {
+        let part = part.trim();
+        let (key, value) = match part.split_once('=') {
+            Some(kv) => kv,
+            None => continue,
+        };
+        let value = value.trim().trim_matches('"');
+        match key.trim() {
+            "realm" => realm = Some(value.to_string()),
+            "service" => service = Some(value.to_string()),
+            "scope" => scope = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    Some(AuthChallenge {
+        realm: realm?,
+        service,
+        scope,
+    })
+}
+
+async fn fetch_bearer_token(
+    client: &reqwest::Client,
+    challenge: &AuthChallenge,
+    creds: Option<&RegistryCredentials>,
+) -> Result<String> {
+    let mut url = reqwest::Url::parse(&challenge.realm)
+        .map_err(|e| format!("Invalid auth realm URL {:?}: {}", challenge.realm, e))?;
+
+    {
+        let mut q = url.query_pairs_mut();
+        if let Some(service) = &challenge.service {
+            q.append_pair("service", service);
+        }
+        if let Some(scope) = &challenge.scope {
+            q.append_pair("scope", scope);
+        }
+    }
+
+    let mut req = client.get(url);
+    if let Some(c) = creds {
+        req = req.basic_auth(&c.username, Some(&c.password));
+    }
+
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        return Err(ControllerError::Other(format!(
+            "Token endpoint returned status {}",
+            resp.status()
+        )));
+    }
+    let json: serde_json::Value = resp.json().await?;
+
+    let token = json["token"]
+        .as_str()
+        .or_else(|| json["access_token"].as_str())
+        .ok_or("No token in auth response")?;
+
+    Ok(token.to_string())
+}
+
+async fn resolve_pull_secret_credentials(
+    client: &Client,
+    namespace: &str,
+    secret_names: &[String],
+    registry: &str,
+) -> Option<RegistryCredentials> {
+    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+
+    for name in secret_names {
+        let secret = match api.get(name).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "Failed to read imagePullSecret {}/{}: {}",
+                    namespace, name, e
+                );
+                continue;
+            }
+        };
+
+        let data = match secret.data.as_ref() {
+            Some(d) => d,
+            None => continue,
+        };
+
+        let config_bytes = match data
+            .get(".dockerconfigjson")
+            .or_else(|| data.get("config.json"))
+        {
+            Some(b) => &b.0,
+            None => continue,
+        };
+
+        let config: serde_json::Value = match serde_json::from_slice(config_bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "Failed to parse dockerconfigjson in {}/{}: {}",
+                    namespace, name, e
+                );
+                continue;
+            }
+        };
+
+        let auths = match config.get("auths").and_then(|v| v.as_object()) {
+            Some(a) => a,
+            None => continue,
+        };
+
+        for (key, value) in auths {
+            if !registry_key_matches(key, registry) {
+                continue;
+            }
+            if let Some(creds) = extract_credentials_from_auth_entry(value) {
+                debug!(
+                    "Using credentials from imagePullSecret {}/{} for {}",
+                    namespace, name, registry
+                );
+                return Some(creds);
+            }
+        }
+    }
+
+    None
+}
+
+fn registry_key_matches(key: &str, registry: &str) -> bool {
+    let host = key
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(key)
+        .trim_end_matches('/');
+
+    if host.eq_ignore_ascii_case(registry) {
+        return true;
+    }
+
+    // Docker Hub uses several aliases interchangeably in dockerconfigjson.
+    let docker_hub_aliases = ["docker.io", "index.docker.io", "registry-1.docker.io"];
+    let host_is_hub = docker_hub_aliases
+        .iter()
+        .any(|a| host.eq_ignore_ascii_case(a));
+    let registry_is_hub = registry.is_empty()
+        || docker_hub_aliases
+            .iter()
+            .any(|a| registry.eq_ignore_ascii_case(a));
+    host_is_hub && registry_is_hub
+}
+
+fn extract_credentials_from_auth_entry(entry: &serde_json::Value) -> Option<RegistryCredentials> {
+    if let Some(b64) = entry.get("auth").and_then(|v| v.as_str())
+        && !b64.is_empty()
+        && let Ok(decoded) = BASE64.decode(b64)
+        && let Ok(s) = String::from_utf8(decoded)
+        && let Some((u, p)) = s.split_once(':')
+    {
+        return Some(RegistryCredentials {
+            username: u.to_string(),
+            password: p.to_string(),
+        });
+    }
+
+    let username = entry.get("username").and_then(|v| v.as_str())?;
+    let password = entry.get("password").and_then(|v| v.as_str())?;
+    Some(RegistryCredentials {
+        username: username.to_string(),
+        password: password.to_string(),
+    })
 }
 
 async fn trigger_rollout(
@@ -346,4 +636,91 @@ async fn update_digest_annotation(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_image_reference_handles_common_forms() {
+        assert_eq!(
+            parse_image_reference("nginx").unwrap(),
+            ("docker.io".into(), "nginx".into(), "latest".into())
+        );
+        assert_eq!(
+            parse_image_reference("nginx:1.27").unwrap(),
+            ("docker.io".into(), "nginx".into(), "1.27".into())
+        );
+        assert_eq!(
+            parse_image_reference("library/nginx:1.27").unwrap(),
+            ("docker.io".into(), "library/nginx".into(), "1.27".into())
+        );
+        assert_eq!(
+            parse_image_reference("ghcr.io/librenz/runcontainers/frontend:latest").unwrap(),
+            (
+                "ghcr.io".into(),
+                "librenz/runcontainers/frontend".into(),
+                "latest".into()
+            )
+        );
+    }
+
+    #[test]
+    fn parse_www_authenticate_extracts_bearer_params() {
+        let header = r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:librenz/foo:pull""#;
+        let challenge = parse_www_authenticate(header).expect("parse should succeed");
+        assert_eq!(challenge.realm, "https://ghcr.io/token");
+        assert_eq!(challenge.service.as_deref(), Some("ghcr.io"));
+        assert_eq!(
+            challenge.scope.as_deref(),
+            Some("repository:librenz/foo:pull")
+        );
+    }
+
+    #[test]
+    fn parse_www_authenticate_rejects_basic() {
+        assert!(parse_www_authenticate(r#"Basic realm="foo""#).is_none());
+    }
+
+    #[test]
+    fn registry_key_matches_handles_aliases_and_paths() {
+        assert!(registry_key_matches("ghcr.io", "ghcr.io"));
+        assert!(registry_key_matches("https://ghcr.io", "ghcr.io"));
+        assert!(registry_key_matches("https://index.docker.io/v1/", "docker.io"));
+        assert!(registry_key_matches("docker.io", "index.docker.io"));
+        assert!(!registry_key_matches("ghcr.io", "gcr.io"));
+        assert!(!registry_key_matches("quay.io", "ghcr.io"));
+    }
+
+    #[test]
+    fn extract_credentials_decodes_base64_auth() {
+        let entry = serde_json::json!({
+            "auth": BASE64.encode("alice:s3cret"),
+        });
+        let creds = extract_credentials_from_auth_entry(&entry).unwrap();
+        assert_eq!(creds.username, "alice");
+        assert_eq!(creds.password, "s3cret");
+    }
+
+    #[test]
+    fn extract_credentials_falls_back_to_username_password() {
+        let entry = serde_json::json!({
+            "username": "bob",
+            "password": "pw",
+        });
+        let creds = extract_credentials_from_auth_entry(&entry).unwrap();
+        assert_eq!(creds.username, "bob");
+        assert_eq!(creds.password, "pw");
+    }
+
+    #[test]
+    fn extract_credentials_handles_password_with_colon() {
+        let entry = serde_json::json!({
+            "auth": BASE64.encode("user:pa:ss"),
+        });
+        let creds = extract_credentials_from_auth_entry(&entry).unwrap();
+        assert_eq!(creds.username, "user");
+        assert_eq!(creds.password, "pa:ss");
+    }
 }

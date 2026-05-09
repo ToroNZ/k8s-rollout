@@ -25,6 +25,10 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments/status"]
     verbs: ["get"]
+  # Need to read imagePullSecrets to authenticate to private registries
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
